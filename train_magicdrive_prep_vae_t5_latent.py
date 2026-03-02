@@ -1,0 +1,578 @@
+import os
+from contextlib import nullcontext
+import sys
+import numpy as np
+import random
+from copy import deepcopy
+from datetime import timedelta
+from pprint import pformat
+
+sys.path.append(".")
+DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "gpu")
+
+import torch
+if not torch.cuda.is_available() or DEVICE_TYPE == 'npu':
+    USE_NPU = True
+    os.environ['DEVICE_TYPE'] = "npu"
+    DEVICE_TYPE = "npu"
+    print("Enable NPU!")
+    try:
+        # just before torch_npu, let xformers know there is no gpu
+        import xformers
+        import xformers.ops
+    except Exception as e:
+        print(f"Got {e} during import xformers!")
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+else:
+    USE_NPU = False
+import magicdrivedit.utils.module_contrib
+
+import torch.distributed as dist
+from einops import rearrange, repeat
+import colossalai
+from colossalai.booster import Booster
+from colossalai.cluster import DistCoordinator
+from colossalai.nn.optimizer import HybridAdam
+from colossalai.utils import get_current_device, set_seed
+from tqdm import tqdm
+from mmcv.parallel import DataContainer
+
+import logging
+import warnings
+from shapely.errors import ShapelyDeprecationWarning
+warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
+warnings.simplefilter(action='ignore', category=FutureWarning)
+logging.getLogger('shapely.geos').setLevel(logging.WARNING)
+logging.getLogger('numba.core').setLevel(logging.INFO)
+logging.getLogger('magicdrivedit.models.vae.vae_cogvideox').setLevel(logging.WARNING)
+
+from magicdrivedit.acceleration.checkpoint import set_grad_checkpoint
+from magicdrivedit.acceleration.parallel_states import get_data_parallel_group, get_sequence_parallel_group, set_data_parallel_group
+from magicdrivedit.datasets.dataloader import prepare_dataloader
+from magicdrivedit.registry import DATASETS, MODELS, SCHEDULERS, build_module
+from magicdrivedit.utils.ckpt_utils import load, model_gathering, model_sharding, record_model_param_shape, save, prepare_ckpt, RandomStateManager
+from magicdrivedit.utils.config_utils import define_experiment_workspace, parse_configs, save_training_config, merge_dataset_cfg, mmengine_conf_get, mmengine_conf_set
+from magicdrivedit.utils.lr_scheduler import LinearWarmupLR, MultiStepWithLinearWarmupLR
+from magicdrivedit.utils.misc import (
+    Timer,
+    all_reduce_mean,
+    reset_logger,
+    create_tensorboard_writer,
+    format_numel_str,
+    get_model_numel,
+    requires_grad,
+    to_torch_dtype,
+    collate_bboxes_to_maxlen,
+    move_to,
+    add_box_latent,
+)
+from magicdrivedit.utils.train_utils import MaskGenerator, create_colossalai_plugin, update_ema, run_validation, sp_vae
+
+
+def main():
+    # ======================================================
+    # 1. configs & runtime variables
+    # ======================================================
+    # == parse configs ==
+    # ======================================================
+    # 1. configs & runtime variables
+    # ======================================================
+    # == parse configs ==
+    cfg = parse_configs(training=True)
+    if cfg.get("vsdebug", False):
+        import debugpy
+        debugpy.listen(5678)
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
+        print('Attached, continue...')
+        cfg.record_time = True
+    enable_debug = cfg.get("debug", False)
+    if enable_debug:
+        cfg.outputs = os.path.join(cfg.get("outputs", "outputs"), "debug")
+        cfg.ckpt_every = 50
+        cfg.record_time = True
+    verbose_mode = cfg.get("verbose_mode", False)
+    if verbose_mode:
+        cfg.record_time = True
+    record_time = cfg.get("record_time", False)
+    
+    # data config
+    if cfg.num_frames is None:  # variable length dataset!
+        num_data_cfgs = len(cfg.data_cfg_names)
+        datasets = []
+        val_datasets = []
+        for idx, (res, data_cfg_name) in enumerate(cfg.data_cfg_names):
+            overrides = cfg.get("dataset_cfg_overrides", [[]] * num_data_cfgs)[idx]
+            dataset, val_dataset = merge_dataset_cfg(cfg, data_cfg_name, overrides)
+            datasets.append((res, dataset))
+            val_datasets.append((res, val_dataset))
+        cfg.dataset = {"type": "NuScenesMultiResDataset", "cfg": datasets}
+        cfg.val_dataset = {"type": "NuScenesMultiResDataset", "cfg": val_datasets}
+    else:  # single dataset!
+        cfg.dataset, cfg.val_dataset = merge_dataset_cfg(
+            cfg, cfg.data_cfg_name, cfg.get("dataset_cfg_overrides", []),
+            cfg.num_frames)
+ 
+    # == device and dtype ==
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    cfg_dtype = cfg.get("dtype", "bf16")
+    assert cfg_dtype in ["fp16", "bf16"], f"Unknown mixed precision {cfg_dtype}"
+    dtype = to_torch_dtype(cfg.get("dtype", "bf16"))
+    if USE_NPU:  # disable some kernels
+        if mmengine_conf_get(cfg, "text_encoder.shardformer", None):
+            mmengine_conf_set(cfg, "text_encoder.shardformer", False)
+        if mmengine_conf_get(cfg, "model.bbox_embedder_param.enable_xformers", None):
+            mmengine_conf_set(cfg, "model.bbox_embedder_param.enable_xformers", False)
+        if mmengine_conf_get(cfg, "model.frame_emb_param.enable_xformers", None):
+            mmengine_conf_set(cfg, "model.frame_emb_param.enable_xformers", False)
+
+    # == colossalai init distributed training ==
+    # NOTE: A very large timeout is set to avoid some processes exit early
+    # dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
+    # torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+    is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if is_distributed:
+        # 多卡模式：由启动器提供参数
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+    else:
+        # 单卡模式：手动设置必要环境变量
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        dist.init_process_group(backend="nccl", rank=0, world_size=1)
+        torch.cuda.set_device(0)
+    
+    set_seed(cfg.get("seed", 1024))
+    torch.cuda.manual_seed_all(cfg.get("seed", 1024))
+    coordinator = DistCoordinator()
+    # a bug with DistCoordinator
+    # coordinator._local_rank = int(coordinator._local_rank)
+    coordinator._local_rank = int(os.environ.get("LOCAL_RANK", 0)) if is_distributed else 0
+    device = get_current_device()
+
+    # == init exp_dir ==
+    if cfg.get("overfit", None) is not None:
+        cfg.tag = f"{cfg.tag}_" if cfg.get("tag", "") != "" else ""
+        cfg.tag += "overfit-" + str(cfg.get("overfit", None))
+    exp_name, exp_dir = define_experiment_workspace(cfg, use_date=True)
+    coordinator.block_all()
+    if coordinator.is_node_master():
+        os.makedirs(exp_dir, exist_ok=True)
+        save_training_config(cfg.to_dict(), exp_dir)
+    coordinator.block_all()
+
+    # == init logger, tensorboard & wandb ==
+    logger = reset_logger(exp_dir, enable_debug)
+    logger.info("Experiment directory created at %s", exp_dir)
+    logger.info("Training configuration:\n %s", pformat(cfg.to_dict()))
+    logger.info(f"ColossalAI version: {colossalai.__version__}")
+    if coordinator.is_master():
+        tb_writer = create_tensorboard_writer(exp_dir)
+  
+    # == init ColossalAI booster ==
+    plugin = create_colossalai_plugin(
+        plugin=cfg.get("plugin", "zero2"),
+        dtype=cfg_dtype,
+        grad_clip=cfg.get("grad_clip", 0),
+        sp_size=cfg.get("sp_size", 1),
+        reduce_bucket_size_in_m=cfg.get("reduce_bucket_size_in_m", 20),
+        # NOTE: do not enable this, precision do not match.
+        overlap_allgather=cfg.get("overlap_allgather", False),
+        verbose=verbose_mode,
+    )
+    # === 在 booster = Booster(plugin=plugin) 之前添加 ===
+
+    if not hasattr(plugin, 'pg_mesh'):
+        # 注入一个伪属性防止报错
+        plugin.pg_mesh = None
+        # 如果它还有 destroy_mesh_process_groups 方法的调用，也给它一个空函数
+        plugin.destroy_mesh_process_groups = lambda: None
+    booster = Booster(plugin=plugin)
+    torch.set_num_threads(1)
+
+    # ======================================================
+    # 2. build dataset and dataloader
+    # ======================================================
+    logger.info("Building dataset...")
+    # == build dataset ==
+    
+    dataset = build_module(cfg.dataset, DATASETS)
+    if cfg.get("overfit", None) is not None:
+        _overfit_idxs = random.sample(range(len(dataset)), cfg.overfit)
+        logger.info(f"Overfit on: {_overfit_idxs}")
+        overfit_idxs = []
+        for _ in range(cfg.epochs):
+            overfit_idxs += _overfit_idxs
+            random.shuffle(_overfit_idxs)
+        cfg.epochs = 1
+        dataset = torch.utils.data.Subset(dataset, overfit_idxs)
+    logger.info("Dataset contains %s samples.", len(dataset))
+    
+    # == build dataloader ==
+    dataloader_args = dict(
+        dataset=dataset,
+        batch_size= cfg.get("batch_size", None),
+        num_workers=cfg.get("num_workers", 1), ###### 4
+        seed=cfg.get("seed", 1024),
+        shuffle=True if cfg.get("overfit", None) is None else False,
+        drop_last=True,
+        pin_memory=True,
+        process_group=get_data_parallel_group(),
+        prefetch_factor=cfg.get("prefetch_factor", None),
+    )
+    dataloader, sampler = prepare_dataloader(
+        bucket_config=cfg.get("bucket_config", None),
+        num_bucket_build_workers=cfg.get("num_bucket_build_workers", 1),
+        **dataloader_args,
+    )
+    num_steps_per_epoch = len(dataloader)
+
+    # val
+    if cfg.get("overfit", None) is not None:
+        # first n samples, actually this is all unique samples.
+        val_dataset = torch.utils.data.Subset(dataset, list(range(cfg.overfit)))
+    else:
+        val_dataset = build_module(cfg.val_dataset, DATASETS)
+        if cfg.val.validation_index != "all":
+            if len(cfg.val.validation_index) < get_data_parallel_group().size():
+                if isinstance(cfg.val.validation_index[0], int):
+                    # we use max world size 32 before, keep the same.
+                    cfg.val.validation_index += random.sample(
+                        list(set(range(len(val_dataset))) - set(cfg.val.validation_index)),
+                        min(get_data_parallel_group().size(), 32) - len(cfg.val.validation_index),
+                    )
+                    # for larger than 32, add them one-by-one.
+                    if get_data_parallel_group().size() > 32:
+                        while len(cfg.val.validation_index) < get_data_parallel_group().size():
+                            cfg.val.validation_index += random.sample(
+                                list(set(range(len(val_dataset)))
+                                     - set(cfg.val.validation_index)), 1,
+                            )
+                else:
+                    while len(cfg.val.validation_index) < get_data_parallel_group().size():
+                        new_key = val_dataset.rand_another_key()
+                        if new_key not in cfg.val.validation_index:
+                            cfg.val.validation_index.append(new_key)
+                logging.info(f"validation_index rewrite as: {cfg.val.validation_index}")
+            val_dataset = torch.utils.data.Subset(
+                val_dataset, cfg.val.validation_index)
+        else:
+            raise NotImplementedError()
+    logger.info("Val Dataset contains %s samples.", len(val_dataset))
+    dataloader_args['shuffle'] = False
+    dataloader_args['dataset'] = val_dataset
+    dataloader_args['batch_size'] = cfg.val.get("batch_size", 1)
+    dataloader_args['num_workers'] = cfg.val.get("num_workers", 1) # 2
+    val_dataloader, val_sampler = prepare_dataloader(
+        bucket_config=cfg.get("bucket_config", None),
+        num_bucket_build_workers=cfg.get("num_bucket_build_workers", 1),
+        **dataloader_args,
+    )
+
+    def collate_data_container_fn(batch, *, collate_fn_map=None):
+        return batch
+    # add datacontainer handler
+    torch.utils.data._utils.collate.default_collate_fn_map.update({
+        DataContainer: collate_data_container_fn
+    })
+
+    # ======================================================
+    # 3. build model
+    # ======================================================
+    logger.info("Building models...")
+    # == build text-encoder and vae ==
+    # NOTE: set to true/false,
+    # https://github.com/huggingface/transformers/issues/5486
+    # if the program gets stuck, try set it to false
+    os.environ['TOKENIZERS_PARALLELISM'] = "true"
+    text_encoder = build_module(cfg.get("text_encoder", None), MODELS, device=device, dtype=dtype)
+    if text_encoder is not None:
+        text_encoder_output_dim = text_encoder.output_dim
+        text_encoder_model_max_length = text_encoder.model_max_length
+    else:
+        text_encoder_output_dim = cfg.get("text_encoder_output_dim", 4096)
+        text_encoder_model_max_length = cfg.get("text_encoder_model_max_length", 300)
+
+    # == build vae ==
+    vae = build_module(cfg.get("vae", None), MODELS)
+    if vae is not None:
+        vae = vae.to(device, dtype).eval()
+    # if vae is not None:
+    #     input_size = (dataset.num_frames, *dataset.image_size)
+    #     latent_size = vae.get_latent_size(input_size)
+    #     vae_out_channels = vae.out_channels
+    # else:
+    latent_size = (None, None, None)
+    vae_out_channels = cfg.get("vae_out_channels", 4)
+ 
+    # # == build diffusion model ==
+    # model = (
+    #     build_module(
+    #         cfg.model,
+    #         MODELS,
+    #         input_size=latent_size,
+    #         in_channels=vae_out_channels,
+    #         caption_channels=text_encoder_output_dim,
+    #         model_max_length=text_encoder_model_max_length,
+    #         enable_sequence_parallelism=cfg.get("sp_size", 1) > 1,
+    #     )
+    #     .to(device, dtype)
+    #     .train()
+    # )
+    
+    # model.prepare_text_embedding(text_encoder)
+    # # partial load pretrain (e.g., image pretrain)
+    # if cfg.get("partial_load", None) and not cfg.get("load", None):
+    #     load_dir = cfg.partial_load
+    #     if os.path.isdir(load_dir):
+    #         from glob import glob
+    #         weight = {}
+    #         for path in glob(os.path.join(load_dir, "model/pytorch_model-*")):
+    #             weight.update(torch.load(path, map_location="cpu"))
+    #     else:
+    #         weight = torch.load(load_dir, map_location="cpu")
+    #     missing_keys, unexpected_keys = model.load_state_dict(weight, strict=False)
+    #     logger.info(f"[partial load] Missing keys: {missing_keys}")
+    #     logger.info(f"[partial load] Unexpected keys: {unexpected_keys}")
+    #     del weight, missing_keys, unexpected_keys
+    # model_numel, model_numel_trainable = get_model_numel(model)
+    # logger.info(
+    #     "[Diffusion] Trainable model params: %s, Fix: %s, Total model params: %s",
+    #     format_numel_str(model_numel_trainable),
+    #     format_numel_str(model_numel - model_numel_trainable),
+    #     format_numel_str(model_numel),
+    # )
+
+    # # == build ema for diffusion model ==
+    # ema = deepcopy(model).to(torch.float32).to(device)
+    # requires_grad(ema, False)
+    # ema_shape_dict = record_model_param_shape(ema)
+    # ema.eval()
+    # update_ema(ema, model, decay=0, sharded=False)
+    
+    # # try:
+    # #     load_dir = cfg.partial_load
+    # #     ema.load_state_dict(
+    # #         torch.load(os.path.join(load_dir, "ema.pt"), map_location=torch.device("cpu")),
+    # #         strict=False,
+    # #     )
+    # # except Exception as e:
+    # #     print(e)
+    # #     logging.exception(e)
+    # #     logging.warning(f"Got {e} from ema loading, we will not load ema model!")
+    # #     update_ema(ema, model.module, decay=0, sharded=False)
+
+    # # == setup loss function, build scheduler ==
+    # scheduler = build_module(cfg.scheduler, SCHEDULERS)
+
+    # # == setup optimizer ==
+    # optimizer = HybridAdam(
+    #     filter(lambda p: p.requires_grad, model.parameters()),
+    #     adamw_mode=True,
+    #     lr=cfg.get("lr", 1e-4),
+    #     weight_decay=cfg.get("weight_decay", 0),
+    #     eps=cfg.get("adam_eps", 1e-8),
+    # )
+
+    # warmup_steps = cfg.get("warmup_steps", None)
+    # milestones_lr = cfg.get("milestones_lr", None)
+
+    # if warmup_steps is None:
+    #     lr_scheduler = None
+    # else:
+    #     if milestones_lr is None:
+    #         lr_scheduler = LinearWarmupLR(optimizer, warmup_steps=warmup_steps)
+    #     else:
+    #         lr_scheduler = MultiStepWithLinearWarmupLR(
+    #             optimizer, milestones_lr=milestones_lr, warmup_steps=warmup_steps)
+
+    # # == additional preparation ==
+    # if cfg.get("grad_checkpoint", False):
+    #     set_grad_checkpoint(model)
+    # if cfg.get("mask_ratios", None) is not None:
+    #     mask_generator = MaskGenerator(cfg.mask_ratios)
+
+    # # =======================================================
+    # # 4. distributed training preparation with colossalai
+    # # =======================================================
+    # logger.info("Preparing for distributed training...")
+    # # == boosting ==
+    # # NOTE: we set dtype first to make initialization of model consistent with the dtype; then reset it to the fp32 as we make diffusion scheduler in fp32
+    # torch.set_default_dtype(dtype)
+    # model, optimizer, _, dataloader, lr_scheduler = booster.boost(
+    #     model=model,
+    #     optimizer=optimizer,
+    #     lr_scheduler=lr_scheduler,
+    #     dataloader=dataloader,
+    # )
+    # torch.set_default_dtype(torch.float)
+    # logger.info("Boosting model for distributed training")
+
+    # # == global variables ==
+    # cfg_epochs = cfg.get("epochs", 1000)
+    # start_epoch = start_step = log_step = acc_step = 0
+    # drop_cond_ratio = cfg.get("drop_cond_ratio", 0.0)
+    # drop_cond_ratio_t = cfg.get("drop_cond_ratio_t", 0.4)
+    # running_loss = 0.0
+    # logger.info("Training for %s epochs with %s steps per epoch", cfg_epochs, num_steps_per_epoch)
+    
+    # # == resume ==
+    # if cfg.get("load", None) is not None:
+    #     logger.info("Loading checkpoint")
+    #     ret = load(
+    #         booster,
+    #         cfg.load,
+    #         model=model,
+    #         ema=ema,
+    #         optimizer=optimizer,
+    #         lr_scheduler=None if cfg.get("reset_lr", False) or cfg.get("start_from_scratch", False) else lr_scheduler,
+    #         sampler=None if cfg.get("start_from_scratch", False) else sampler,
+    #         local_master=coordinator.is_node_master(),
+    #     )
+    #     if not cfg.get("start_from_scratch", False):
+    #         start_epoch, start_step = ret
+    #         if cfg.get("reset_lr", False) and lr_scheduler:
+    #             total_step = start_epoch * num_steps_per_epoch + start_step
+    #             lr_scheduler.last_epoch = total_step
+    #     logger.info("Loaded checkpoint %s at epoch %s step %s", cfg.load, start_epoch, start_step)
+
+    # if enable_debug:
+    #     save_dir = save(
+    #         booster,
+    #         exp_dir,
+    #         model=model,
+    #         ema=ema,
+    #         optimizer=optimizer,
+    #         lr_scheduler=lr_scheduler,
+    #         sampler=sampler,
+    #         epoch=start_epoch,
+    #         step=start_step,
+    #         global_step=start_epoch * num_steps_per_epoch + start_step,
+    #         batch_size=cfg.get("batch_size", None),
+    #     )
+    #     logger.info(f"Save your model to {save_dir} before training.")
+
+    # model_sharding(ema)
+
+    # if cfg.get("validation_before_run", False):
+    #     with RandomStateManager(verbose=True):
+    #         coordinator.block_all()
+    #         run_validation(
+    #             cfg.val,
+    #             text_encoder,
+    #             vae,
+    #             model,
+    #             device,
+    #             dtype,
+    #             val_dataloader,
+    #             coordinator,
+    #             start_epoch * num_steps_per_epoch + start_step,
+    #             exp_dir,
+    #             cfg.mv_order_map,
+    #             cfg.t_order_map,
+    #         )
+    #         val_sampler.reset()
+
+    # with RandomStateManager(verbose=True):
+    #     print(f"{torch.randn(3)} {torch.randn(3, device=get_current_device())} "
+    #           f"on rank {dist.get_rank()} "
+    #           f"dp_rank {dist.get_rank(get_data_parallel_group())}")
+
+    # # =======================================================
+    # # 5. training loop
+    # # =======================================================
+    # torch.cuda.empty_cache()
+    # torch.cuda.synchronize()
+    # coordinator.block_all()
+    # timers = {}
+    # timer_keys = [
+    #     "move_data",
+    #     "encode",
+    #     "move_data2",
+    #     "mask",
+    #     "diffusion",
+    #     "backward",
+    #     "update_ema",
+    #     "reduce_loss",
+    #     "misc",
+    # ]
+    # for key in timer_keys:
+    #     if record_time:
+    #         timers[key] = Timer(key, coordinator=None)
+    #     else:
+    #         timers[key] = nullcontext()
+
+
+    save_dir = '/media/omnisky/12dd907f-8a2c-4a49-954c-a33edc979c06/PublicDatasets/nuscenes/MagicDriveDiT-nuScenes-metadata/latent/'
+    os.makedirs(save_dir, exist_ok=True)
+   
+    dtype1=to_torch_dtype(cfg.get("dtype", "float32"))
+    # 4. 提取循环
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(dataloader)):
+            # 获取唯一标识符 (假设 dataset 返回的信息中有 sample_token)
+            # 如果没有，可以使用索引 i
+            sample_id = batch.get('sample_idx', [f"{i:06d}"])[0]
+            
+            # --- 处理视频/图像 (VAE) ---
+            x = batch.pop("pixel_values").to(device, dtype)  # B T NC C H W
+            B, T, NC, C, H, W = x.shape
+            
+            x = x.view(B * NC, C, T, H, W)
+            # 使用 VAE 编码
+            latents = vae.encode(x) # 得到 latent 特征
+            
+            # --- 处理文本 (T5) ---
+            captions = batch.pop("captions")[0] 
+            text_ret = text_encoder.encode(captions)
+            y = text_ret['y']      # 文字 Embedding
+            y_mask = text_ret['mask'] # 文字 Mask
+
+            # --- 处理地图和辅助信息 ---
+            maps = batch.pop("bev_map_with_aux").to(device, dtype)
+            
+            # --- 处理 3D BBox ---
+            bbox_raw = batch.pop("bboxes_3d_data")
+            bbox_list = [bbox_i.data for bbox_i in bbox_raw]
+            bbox_collated = collate_bboxes_to_maxlen(bbox_list, device, dtype, NC, T)
+            # 模拟模型内部的 box latent 逻辑
+            # 注意：此处需要调用模型中的 sample_box_latent 逻辑，如果只是预计算，可以先存原始值
+            
+            # --- 处理相机参数和帧信息 ---
+            cams = batch.pop("camera_param").to(device, dtype)
+            rel_pos = batch.pop("frame_emb").to(device, dtype)
+            
+            # 5. 保存为 pth 文件
+            # 辅助参数
+            meta = {
+                "fps": batch.get('fps', torch.tensor([12.0])),
+                "height": batch.get('height', torch.tensor([H])),
+                "width": batch.get('width', torch.tensor([W])),
+                "num_frames": batch.get('num_frames', torch.tensor([T]))
+            }
+            feature_dict = {
+                "latents": latents.cpu(),
+                "y": y.cpu(),
+                "y_mask": y_mask.cpu(),
+                "maps": maps.cpu(),
+                "bbox": {
+                    "bboxes": bbox_collated['bboxes'].cpu(),
+                    "classes": bbox_collated['classes'].cpu(),
+                    "masks": bbox_collated['masks'].cpu(),
+                },
+                "cams": cams.cpu(),
+                "rel_pos": rel_pos.cpu(),
+                "meta": meta
+            }
+            save_path = os.path.join(save_dir, f"{sample_id}.pth")
+            torch.save(feature_dict, save_path)
+            
+
+    print(f"Extraction complete. Data saved to {save_dir}")
+
+if __name__ == "__main__":
+    main()

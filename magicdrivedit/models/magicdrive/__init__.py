@@ -1,0 +1,5 @@
+from .magicdrive_stdit3 import MagicDriveSTDiT3_XL_2
+from .magicdrive_stdit3_dggt import MagicDriveSTDiT3_XL_2_dggt
+from .magicdrive_stdit3_localdpo import MagicDriveSTDiT3_XL_2_localdpo
+# from .magicsora_mmdit import MagicSora
+from .magicsora_stdit3 import MagicSoraSTDiT3v13_XL_2

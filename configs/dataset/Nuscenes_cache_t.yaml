@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - /dataset/Nuscenes_cache
+
+dataset:
+  dataset_type: NuScenesTDataset
+  dataset_process_root: /media/omnisky/12dd907f-8a2c-4a49-954c-a33edc979c06/PublicDatasets/nuscenes/MagicDriveDiT-nuScenes-metadata/nuscenes_mmdet3d-t-keyframes/
+  start_on_keyframe: true
+ 
+  data:
+    train:
+      video_length: ${model.video_length}
+      start_on_keyframe: ${dataset.start_on_keyframe}
+    val:
+      video_length: ${model.video_length}
+      start_on_keyframe: ${dataset.start_on_keyframe}
+    test:
+      video_length: ${model.video_length}
+      start_on_keyframe: ${dataset.start_on_keyframe}
