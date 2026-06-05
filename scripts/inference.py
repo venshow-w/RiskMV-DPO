@@ -10,9 +10,8 @@ from time import time
 
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-sys.path.append(".")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "gpu")
-import debugpy
 import torch
 # if not torch.cuda.is_available() or DEVICE_TYPE == 'npu':
 #     USE_NPU = True
@@ -50,7 +49,6 @@ from magicdrivedit.acceleration.parallel_states import (
     get_data_parallel_group
 )
 from magicdrivedit.datasets import save_sample
-from magicdrivedit.datasets.dataloader import prepare_dataloader
 from magicdrivedit.datasets.dataloader import prepare_dataloader
 from magicdrivedit.models.text_encoder.t5 import text_preprocessing
 from magicdrivedit.registry import DATASETS, MODELS, SCHEDULERS, build_module
@@ -126,37 +124,37 @@ def main():
     if isinstance(cfg.model.from_pretrained, list):
         cfg.model.from_pretrained = cfg.model.from_pretrained[0] 
 
-    # == dataset config ==
-    if cfg.num_frames is None:
-        num_data_cfgs = len(cfg.data_cfg_names)
-        datasets = []
-        val_datasets = []
-        for (res, data_cfg_name), overrides in zip(
-                cfg.data_cfg_names, cfg.get("dataset_cfg_overrides", [[]] * num_data_cfgs)):
-            dataset, val_dataset = merge_dataset_cfg(cfg, data_cfg_name, overrides)
-            datasets.append((res, dataset))
-            val_datasets.append((res, val_dataset))
-        dataset = {"type": "NuScenesMultiResDataset", "cfg": datasets}
-        val_dataset = {"type": "NuScenesMultiResDataset", "cfg": val_datasets}
-    else:
-        dataset, val_dataset = merge_dataset_cfg(
-            cfg, cfg.data_cfg_name, cfg.get("dataset_cfg_overrides", []),
-            cfg.num_frames)
-    if cfg.get("use_train", False):
-        cfg.dataset = dataset
-        tag = cfg.get("tag", "")
-        cfg.tag = "train" if tag == "" else f"{tag}_train"
-    else:
-        cfg.dataset = val_dataset
+    # # == dataset config ==
+    # if cfg.num_frames is None:
+    #     num_data_cfgs = len(cfg.data_cfg_names)
+    #     datasets = []
+    #     val_datasets = []
+    #     for (res, data_cfg_name), overrides in zip(
+    #             cfg.data_cfg_names, cfg.get("dataset_cfg_overrides", [[]] * num_data_cfgs)):
+    #         dataset, val_dataset = merge_dataset_cfg(cfg, data_cfg_name, overrides)
+    #         datasets.append((res, dataset))
+    #         val_datasets.append((res, val_dataset))
+    #     dataset = {"type": "NuScenesMultiResDataset", "cfg": datasets}
+    #     val_dataset = {"type": "NuScenesMultiResDataset", "cfg": val_datasets}
+    # else:
+    #     dataset, val_dataset = merge_dataset_cfg(
+    #         cfg, cfg.data_cfg_name, cfg.get("dataset_cfg_overrides", []),
+    #         cfg.num_frames)
+    # if cfg.get("use_train", False):
+    #     cfg.dataset = dataset
+    #     tag = cfg.get("tag", "")
+    #     cfg.tag = "train" if tag == "" else f"{tag}_train"
+    # else:
+    #     cfg.dataset = val_dataset
 
-    # set img_collate_param
-    if hasattr(cfg.dataset, "img_collate_param"):
-        cfg.dataset.img_collate_param.is_train = False  # Important!
-    else:
-        for d in cfg.dataset.cfg:
-            d[1].img_collate_param.is_train = False  # Important!
-    cfg.batch_size = 1
-    # for lower cpu memory in dataloading
+    # # set img_collate_param
+    # if hasattr(cfg.dataset, "img_collate_param"):
+    #     cfg.dataset.img_collate_param.is_train = False  # Important!
+    # else:
+    #     for d in cfg.dataset.cfg:
+    #         d[1].img_collate_param.is_train = False  # Important!
+    # cfg.batch_size = 1
+    # # for lower cpu memory in dataloading
     cfg.ignore_ori_imgs = cfg.get("ignore_ori_imgs", False) ### True
     if cfg.ignore_ori_imgs:
         cfg.dataset.drop_ori_imgs = True
@@ -228,7 +226,7 @@ def main():
     logger = reset_logger(exp_dir)
     logger.info("Inference configuration:\n %s", pformat(cfg.to_dict()))
     verbose = cfg.get("verbose", 1)
-
+    
     # ======================================================
     # 2. build dataset and dataloader
     # ======================================================
@@ -242,16 +240,16 @@ def main():
             for idx, (res, data_cfg_name) in enumerate(cfg.data_cfg_names):
                 # 获取对应的 override 配置
                 overrides = cfg.get("dataset_cfg_overrides", [[]] * num_data_cfgs)[idx]
-                dataset, _ = merge_dataset_cfg(cfg, data_cfg_name, overrides)
+                dataset, dataset_val = merge_dataset_cfg(cfg, data_cfg_name, overrides)
                 datasets.append((res, dataset))
             # 显式构造配置字典
-            cfg.dataset = {"type": "NuScenesMultiResDataset", "cfg": datasets}
+            cfg.dataset = {"type": "NuScenesTvalDataset", "cfg": datasets}
         else:  # 单一分辨率模式
-            cfg.dataset, _ = merge_dataset_cfg(
+            cfg.dataset, cfg.val_dataset = merge_dataset_cfg(
                 cfg, cfg.data_cfg_name, cfg.get("dataset_cfg_overrides", []),
                 cfg.num_frames)
         
-        return build_module(cfg.dataset, DATASETS)
+        return build_module(cfg.val_dataset, DATASETS) ############# for validation
 
     if cfg.get("val", None):
         validation_index = cfg.val.validation_index
@@ -265,6 +263,7 @@ def main():
     # == build dataset ==
     logger.info("Building dataset...")
     # dataset = build_module(cfg.dataset, DATASETS)
+    
     dataset = build_real_dataset(cfg)
     if validation_index == "even":
         idxs = list(range(0, len(dataset), 2))
@@ -276,12 +275,12 @@ def main():
         dataset = torch.utils.data.Subset(dataset, validation_index)
     logger.info(f"Your validation index: {validation_index}")
     logger.info("Dataset contains %s samples.", len(dataset))
-
+    
     # == build dataloader ==
     dataloader_args = dict(
         dataset=dataset,
         batch_size=cfg.get("batch_size", 1),
-        num_workers=cfg.get("num_workers", 8),
+        num_workers=cfg.get("num_workers", 0),
         seed=cfg.get("seed", 1024),
         shuffle=isinstance(validation_index, str),  # changed
         drop_last=False,  # changed
@@ -289,6 +288,7 @@ def main():
         process_group=get_data_parallel_group(),
         prefetch_factor=cfg.get("prefetch_factor", None),
     )
+    # breakpoint()
     dataloader, sampler = prepare_dataloader(
         bucket_config=cfg.get("bucket_config", None),
         num_bucket_build_workers=cfg.get("num_bucket_build_workers", 1),
@@ -379,23 +379,25 @@ def main():
             # if os.environ.get('RANK', '0') == '0':
             #     import pdb; pdb.set_trace()
             t_iter_start = time()
-
             time5 = time()
-            first_frame =  batch.pop("first_frames").to(device, dtype)
-            first_frame = rearrange(first_frame, "B T NC C ... -> (B NC) C T ...")
+            first_frame_latent = None
             if cfg.ignore_ori_imgs:
                 B, T, NC = 1, *batch["pixel_values_shape"][0].tolist()[:2]
-                latent_size = vae.get_latent_size(
-                    (T, *batch["pixel_values_shape"][0].tolist()[-2:]))
+                latent_size = vae.get_latent_size((T, *batch["pixel_values_shape"][0].tolist()[-2:]))
                 first_frame_latent = torch.zeros(latent_size,dtype=dtype)
+                
             else:
                 B, T, NC = batch["pixel_values"].shape[:3]
                 latent_size = vae.get_latent_size((T, *batch["pixel_values"].shape[-2:]))
                 # == prepare batch prompts ==
                 x = batch.pop("pixel_values").to(device, dtype)
                 x = rearrange(x, "B T NC C ... -> (B NC) C T ...")  # BxNC, C, T, H, W
+
+                first_frame =  batch.pop("first_frames").to(device, dtype)
+                first_frame = rearrange(first_frame, "B T NC C ... -> (B NC) C T ...")
+
                 first_frame_latent = vae.encode(first_frame)
-                first_frame_latent = rearrange(first_frame_latent, "(B NC) C T ... -> B (C NC) T ...", NC=NC) 
+                first_frame_latent = rearrange(first_frame_latent, "(B NC) C T ... -> B (C NC) T ...", NC=NC).to(device, dtype)
             
             y = batch.pop("captions")[0]  # B, just take first frame
             maps = batch.pop("bev_map_with_aux").to(device, dtype)  # B, T, C, H, W
@@ -421,7 +423,7 @@ def main():
             
             # == model input format ==
             model_args = {}
-            model_args['first_frame_latent'] = first_frame_latent.to(device, dtype)
+            model_args['first_frame_latent'] = first_frame_latent
             model_args["maps"] = maps
             model_args["bbox"] = bbox
             model_args["cams"] = cams
@@ -515,7 +517,7 @@ def main():
                         model.camera_embedder.uncond_cam.to(device),
                         model.frame_embedder.uncond_cam.to(device),
                         prepend=(cfg.scheduler.type == "dpm-solver"),
-                    )  
+                    )     
                 time6 = time()        
                 t_prep = time6 - t_iter_start     
                 # == inference ==
