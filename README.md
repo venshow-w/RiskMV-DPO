@@ -144,20 +144,6 @@ torchrun --standalone --nproc_per_node 1 scripts/inference.py \
 
 Outputs are saved under `outputs/inference/localdpo/<timestamp>/`.
 
----
-
-## Key Hyperparameters (Stage 6)
-
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `lambda_ra` | 1.0 | Region-aware DPO loss weight |
-| `lambda_sft` | 0.1 | Supervised fine-tuning weight |
-| `lambda_align` | 0.01 | VGGT geometry alignment weight |
-| `motion_threshold` | 0.7 | Optical-flow threshold for dynamic regions |
-| `mask_size_range` | (0.1, 0.25) | Local mask area ratio |
-| `lr` | 2e-5 | Learning rate (new modules only) |
-| `num_geo_tokens` | 16 | Geometry latent token count |
-
 
 ---
 
