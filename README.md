@@ -1,6 +1,6 @@
 # DesDriveWorld / RiskMV-DPO
 
-Official PyTorch implementation of **DesDriveWorld: A Description-Enhanced World Model with 3D Structural Consistency for Autonomous Driving** (CVPR 2026).
+Official PyTorch implementation of **Risk-Controllable Multi-View Diffusion for Driving Scenario Generation** (CVPR 2026).
 
 This repository releases **RiskMV-DPO** — a parameter-efficient fine-tuning framework that improves multi-view driving video generation with **region-aware LocalDPO** and **geometry-guided adaptive modulation (GAM)**, built on top of [MagicDrive-V2](https://github.com/flymin/MagicDrive-V2).
 
