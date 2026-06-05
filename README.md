@@ -158,20 +158,6 @@ Outputs are saved under `outputs/inference/localdpo/<timestamp>/`.
 | `lr` | 2e-5 | Learning rate (new modules only) |
 | `num_geo_tokens` | 16 | Geometry latent token count |
 
----
-
-## Citation
-
-If you find this work useful, please cite:
-
-```bibtex
-@inproceedings{desdriveworld2026,
-  title     = {DesDriveWorld: A Description-Enhanced World Model with 3D Structural Consistency for Autonomous Driving},
-  author    = {TODO},
-  booktitle = {CVPR},
-  year      = {2026}
-}
-```
 
 ---
 
